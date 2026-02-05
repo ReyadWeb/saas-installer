@@ -1,34 +1,31 @@
 # saas-installer (public)
 
-This repo contains the **public bootstrap installer** that provisions a fresh Ubuntu VPS and deploys a selected private SaaS app from ReyadWeb.
+This repository is the **public bootstrap installer** that provisions a fresh Ubuntu VPS and deploys a selected **private** ReyadWeb SaaS app.
 
 ## Architecture
 
-- **Repo 1 (public):** this repo (`saas-installer`)
-  - `saas-installer.sh` (curlable bootstrap)
-  - future: an “app catalog” menu
+- **Repo 1 (public):** `saas-installer` (this repo)
+  - `saas-installer.sh` (curlable bootstrap + app catalog)
 
 - **Repo 2..N (private):** one repo per SaaS app (`saastest`, `saas-2`, ...)
-  - Docker Compose stack
+  - Docker Compose stack + app code
   - app-specific scripts/config
 
-## Why this is the right structure
-
-- Public installer stays safe (no secrets).
-- Private SaaS repos remain protected; access is controlled via **SSH Deploy Keys**.
-- Same installer works across many VPS + many domains.
+This structure scales well for installing different SaaS apps across **different domains** and **different VPS** instances.
 
 ## Security model (SSH Deploy Keys)
 
-When you run the installer, it generates a keypair on the VPS and prints the public key.
+The installer generates an SSH keypair on the VPS and prints the **public key**.
 
-You add that public key to the target private repo:
-- GitHub → Repo → Settings → Deploy keys → Add deploy key
-- Read-only recommended
+You add that public key to the target private repo as a **Deploy Key**:
+- GitHub → Private repo → Settings → Deploy keys → Add deploy key
+- **Read-only recommended**
 
-Then rerun the installer and cloning will succeed.
+Only a VPS with an authorized deploy key can clone the private repo.
 
 ## Quick start (fresh Ubuntu)
+
+On the VPS:
 
 ```bash
 mkdir -p ~/installer && cd ~/installer
@@ -37,26 +34,36 @@ chmod +x saas-installer.sh
 ./saas-installer.sh
 ```
 
-### DNS (Cloudflare)
+The script will prompt you for:
+- Domain (FQDN), e.g. `portal.example.com`
+- Which SaaS app to install (currently: **1 app**)
+- Private repo SSH URL (defaults to `git@github.com:ReyadWeb/saastest.git`)
+- Basic Auth user/password (for SaaS #1)
 
-Create an **A record** for your subdomain to the VPS public IP. Example:
-- Name: `portal`  (Cloudflare appends the zone automatically)
-- Target: `VPS_IP`
-- Proxy: ON (orange)
+## Cloudflare DNS
+
+Create an **A record** for the subdomain pointing to the VPS IP:
+
+- Type: `A`
+- Name: `portal`  (Cloudflare appends your zone automatically)
+- Content: `YOUR_VPS_PUBLIC_IP`
+- Proxy: ON (orange cloud)
 
 Cloudflare SSL/TLS:
 - **Full (strict)**
 
-## Important: why we do NOT escape `$` in `.env`
+## Important: Avoid bcrypt `$` interpolation in Docker Compose
 
-Bcrypt hashes contain `$...$` sequences. Docker Compose may try to interpolate them and emit warnings, or break the value.
+Bcrypt hashes contain `$...$` sequences. Docker Compose may try to interpolate them and print warnings or break the value.
 
-**Recommended fix (used by this installer):**
-- write the hash to `caddy.env`
-- load it using `env_file:` (Compose does not interpolate env_file values)
+**Recommended pattern (used by the installer):**
+- Put DB/app config in `.env`
+- Put `APP_DOMAIN`, `BASIC_AUTH_USER`, `BASIC_AUTH_HASH` in `caddy.env`
+- Load `caddy.env` with `env_file:` in `docker-compose.yml`
 
-This is more reliable than the `$$` escape workaround.
+This avoids the fragile `$$` escaping workaround.
 
-## Currently supported app
+## Currently supported SaaS app
 
-1) AutoFix Pro (private repo `ReyadWeb/saastest`)
+### 1) AutoFix Pro (saastest)
+Private repo: `git@github.com:ReyadWeb/saastest.git`

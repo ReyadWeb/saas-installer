@@ -12,8 +12,6 @@ die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 warn() { echo "WARN: $*" >&2; }
 
-require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
-
 # --- sudo handling
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -71,9 +69,9 @@ prompt_inputs_common() {
 }
 
 ensure_prereqs() {
-  info "Installing prerequisites (git, curl, ca-certificates, openssh-client)..."
+  info "Installing prerequisites (git, curl, ca-certificates, openssh-client, python3)..."
   $SUDO apt-get update -y
-  $SUDO apt-get install -y git curl ca-certificates openssh-client
+  $SUDO apt-get install -y git curl ca-certificates openssh-client python3
 }
 
 install_docker_if_missing() {
@@ -95,26 +93,22 @@ install_docker_if_missing() {
   UBUNTU_CODENAME="${VERSION_CODENAME:-}"
   [ -n "$UBUNTU_CODENAME" ] || die "Could not detect Ubuntu codename."
 
-  echo \
-    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME} stable" \
-    | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME} stable"     | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
 
   $SUDO apt-get update -y
   $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-  # Allow current user to run docker without sudo (after re-login)
   if [ "$(id -u)" -ne 0 ]; then
     $SUDO usermod -aG docker "$USER" || true
   fi
 
   info "Docker installed."
   if [ "$(id -u)" -ne 0 ]; then
-    warn "You may need to log out/in to use docker without sudo. This installer will use sudo if needed."
+    warn "You may need to log out/in to use docker without sudo. Installer will use sudo if needed."
   fi
 }
 
 docker_cmd() {
-  # Prefer docker without sudo if it works
   if docker ps >/dev/null 2>&1; then
     echo "docker"
   else
@@ -136,11 +130,11 @@ ensure_ssh_key() {
     chmod 600 "$key_path"
   fi
 
-  # Ensure known_hosts has GitHub (accept-new)
+  # Pre-seed known_hosts (accept-new)
   ssh -o StrictHostKeyChecking=accept-new -i "$key_path" -T git@github.com >/dev/null 2>&1 || true
 
   echo ""
-  info "If the private repo clone fails, add this public key as a Deploy Key (read-only recommended):"
+  info "If private repo clone fails, add this public key as a Deploy Key (read-only recommended):"
   echo "------------------------------------------------------------"
   cat "${key_path}.pub"
   echo "------------------------------------------------------------"
@@ -199,57 +193,55 @@ retry_clone_until_ok() {
       return 0
     fi
 
-    warn "Clone failed (likely missing deploy key access)."
+    warn "Clone failed (likely missing Deploy Key access)."
     echo ""
     echo "Next step:"
     echo "  1) Copy the public key shown above"
     echo "  2) GitHub → private repo → Settings → Deploy keys → Add deploy key"
-    echo "  3) Enable read access (recommended: read-only)"
+    echo "  3) Read-only recommended"
     echo "  4) Then press ENTER to retry"
     echo ""
     read -r -p "Press ENTER to retry (or Ctrl+C to quit): " _
   done
 }
 
-# --- SaaS #1 deploy (saastest)
 deploy_app1() {
   local target_dir="$1"
   local domain="$2"
 
   cd "$target_dir"
 
-  # 1) Ensure .env exists
+  # Ensure .env exists
   if [ ! -f ".env" ]; then
     if [ -f ".env.example" ]; then
       cp .env.example .env
       info "Created .env from .env.example"
     else
-      warn "No .env or .env.example found. Continuing."
+      warn "No .env.example found; continuing."
     fi
   else
     info ".env already exists."
   fi
 
-  # 2) Collect basic auth
+  # Collect basic auth
   echo ""
   read -r -p "Basic Auth username [admin]: " BASIC_AUTH_USER
   BASIC_AUTH_USER="${BASIC_AUTH_USER:-admin}"
 
   echo ""
   echo "Enter Basic Auth password (plaintext)."
-  echo "It will be hashed locally and only the hash is stored."
+  echo "It will be hashed locally; only the hash is stored."
   read -r -s -p "Basic Auth password: " BASIC_AUTH_PASS
   echo ""
   [ -n "${BASIC_AUTH_PASS}" ] || die "Password is required."
 
-  # 3) Generate hash (requires docker)
   local DC
   DC="$(docker_cmd)"
 
   info "Generating BASIC_AUTH_HASH via Caddy..."
   BASIC_AUTH_HASH="$($DC run --rm caddy:2-alpine caddy hash-password --plaintext "$BASIC_AUTH_PASS")"
 
-  # 4) Write caddy.env (IMPORTANT: avoid Compose interpolation issues with $ in bcrypt hashes)
+  # Write caddy.env (prevents $ interpolation warnings)
   cat > caddy.env <<EOF
 APP_DOMAIN=${domain}
 BASIC_AUTH_USER=${BASIC_AUTH_USER}
@@ -258,64 +250,36 @@ EOF
   chmod 600 caddy.env || true
   info "Wrote ./caddy.env"
 
-  # 5) Patch docker-compose.yml if it still interpolates BASIC_AUTH_HASH
+  # Patch docker-compose.yml if needed
   if [ -f "docker-compose.yml" ]; then
     if grep -q 'BASIC_AUTH_HASH: \${BASIC_AUTH_HASH' docker-compose.yml 2>/dev/null; then
-      info "Patching docker-compose.yml to use env_file ./caddy.env (prevents $ interpolation warnings)..."
+      info "Patching docker-compose.yml to use env_file ./caddy.env..."
       python3 - <<'PY'
 import re, pathlib
 p = pathlib.Path("docker-compose.yml")
 s = p.read_text(encoding="utf-8")
 
-# Replace caddy environment mapping with env_file + environment list
-# Works for the known saastest compose layout.
-pattern = re.compile(
-    r"(^\s*caddy:\s*\n(?:^\s{4}.*\n)*)",
-    re.M
-)
-
-m = pattern.search(s)
+m = re.search(r"(^\s*caddy:\s*\n(?:^\s{4}.*\n)*)", s, re.M)
 if not m:
-    raise SystemExit("Could not locate 'caddy:' service block in docker-compose.yml")
+    raise SystemExit("Could not locate 'caddy' service block.")
 
 block = m.group(1)
 
-# Remove any existing environment: mapping under caddy
+# Remove existing environment: mapping under caddy
 block2 = re.sub(r"^\s{4}environment:\s*\n(?:^\s{6,}.*\n)+", "", block, flags=re.M)
 
-# Insert env_file + environment list after build/context/dockerfile (or after caddy: line)
-insert_after = None
+# Insert env_file + environment list right after the caddy: line
 lines = block2.splitlines(True)
-
-# Find best insertion point: after dockerfile line if present; otherwise after build block; otherwise after 'caddy:' line
+insert_at = None
 for i, line in enumerate(lines):
-    if re.match(r"^\s{6}dockerfile:\s", line):
-        insert_after = i
+    if re.match(r"^\s*caddy:\s*$", line):
+        insert_at = i
         break
-if insert_after is None:
-    for i, line in enumerate(lines):
-        if re.match(r"^\s{4}build:\s*$", line):
-            # insert after the build block (until indentation returns to 4 spaces)
-            j = i + 1
-            while j < len(lines) and (lines[j].startswith("      ") or lines[j].startswith("        ")):
-                j += 1
-            insert_after = j - 1
-            break
-if insert_after is None:
-    insert_after = 0
+if insert_at is None:
+    raise SystemExit("Could not find 'caddy:' line inside service block.")
 
 env_snip = "    env_file:\n      - ./caddy.env\n    environment:\n      - APP_DOMAIN\n      - BASIC_AUTH_USER\n      - BASIC_AUTH_HASH\n"
-# Insert after insertion point line
-if insert_after == 0:
-    # after "caddy:" line (which is first line)
-    # find first line index that is 'caddy:'
-    for i, line in enumerate(lines):
-        if re.match(r"^\s*caddy:\s*$", line):
-            insert_after = i
-            break
-
-lines.insert(insert_after + 1, env_snip)
-
+lines.insert(insert_at + 1, env_snip)
 block3 = "".join(lines)
 
 s2 = s[:m.start(1)] + block3 + s[m.end(1):]
@@ -323,18 +287,12 @@ p.write_text(s2, encoding="utf-8")
 PY
       info "docker-compose.yml patched."
     else
-      # If already using env_file, ensure it's present
-      if grep -q 'env_file:' docker-compose.yml; then
-        info "docker-compose.yml already uses env_file (good)."
-      else
-        warn "docker-compose.yml doesn't match expected pattern; no patch applied."
-      fi
+      info "docker-compose.yml already OK (or does not interpolate BASIC_AUTH_HASH)."
     fi
   else
-    die "docker-compose.yml not found in repo."
+    die "docker-compose.yml not found."
   fi
 
-  # 6) Bring up stack
   info "Starting stack (docker compose up -d --build)..."
   $DC compose up -d --build
 
@@ -342,7 +300,7 @@ PY
   info "Deployment finished."
   echo "URL: https://${domain}"
   echo ""
-  echo "Useful commands:"
+  echo "Commands:"
   echo "  cd \"$target_dir\""
   echo "  $DC compose ps"
   echo "  $DC compose logs --tail=200"
@@ -356,24 +314,20 @@ main() {
   ensure_prereqs
   install_docker_if_missing
 
-  # --- per-app configuration
-  REPO_SSH_DEFAULT="$APP1_REPO_DEFAULT"
   echo ""
-  read -r -p "Private repo SSH URL [${REPO_SSH_DEFAULT}]: " REPO_SSH
-  REPO_SSH="${REPO_SSH:-$REPO_SSH_DEFAULT}"
+  read -r -p "Private repo SSH URL [${APP1_REPO_DEFAULT}]: " REPO_SSH
+  REPO_SSH="${REPO_SSH:-$APP1_REPO_DEFAULT}"
 
-  # Derive install dir from repo name
   REPO_NAME="$(basename "$REPO_SSH")"
   REPO_NAME="${REPO_NAME%.git}"
   TARGET_DIR="${BASE_DIR}/${REPO_NAME}"
 
-  # Per-app SSH key
   KEY_PATH="$HOME/.ssh/saas_installer_${REPO_NAME}_ed25519"
 
   ensure_ssh_key "$KEY_PATH"
   retry_clone_until_ok "$REPO_SSH" "$KEY_PATH" "$TARGET_DIR" "$BRANCH"
 
-  case "$APP_ID" in
+  case "${APP_ID}" in
     1) deploy_app1 "$TARGET_DIR" "$APP_DOMAIN" ;;
   esac
 }
