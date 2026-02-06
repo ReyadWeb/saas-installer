@@ -6,28 +6,38 @@ set -euo pipefail
 # - Runs on fresh Ubuntu
 # - Uses SSH deploy keys to clone private SaaS repos
 # - Prompts for domain + basic auth (for SaaS #1)
+#
+# Preflight included:
+#   1) Assert Ubuntu
+#   2) UFW detection + prompt to open ports (22/80/443)
+#   3) Resource checks (CPU/RAM/Disk) + optional swap creation
+#   4) Port conflict detection (80/443)
 # ============================================================
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 warn() { echo "WARN: $*" >&2; }
 
-# --- sudo handling
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null 2>&1 || die "sudo not found (install sudo or run as root)."
   SUDO="sudo"
 fi
 
-# --- defaults
 DEFAULT_BASE_DIR="$HOME/apps"
-DEFAULT_BRANCH=""
 DEFAULT_APP_ID="1"
 
-# --- SaaS catalog (extend later)
 APP1_NAME="AutoFix Pro (saastest)"
 APP1_REPO_DEFAULT="git@github.com:ReyadWeb/saastest.git"
 APP1_DESC="Docker Compose stack: Postgres + Node API + Caddy HTTPS + Basic Auth"
+
+MIN_CPU=1
+REC_CPU=2
+MIN_RAM_MB=1500
+REC_RAM_MB=2000
+MIN_DISK_MB=10000
+REC_DISK_MB=20000
+SWAP_MB=2048
 
 print_header() {
   cat <<'EOF'
@@ -35,6 +45,127 @@ print_header() {
  ReyadWeb SaaS Installer (Ubuntu + Cloudflare friendly)
 ============================================================
 EOF
+}
+
+assert_ubuntu() {
+  [ -f /etc/os-release ] || die "Cannot detect OS (missing /etc/os-release). This installer supports Ubuntu."
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  if [ "${ID:-}" != "ubuntu" ]; then
+    die "Unsupported OS: ${PRETTY_NAME:-unknown}. This installer supports Ubuntu only."
+  fi
+  info "OS OK: ${PRETTY_NAME:-Ubuntu}"
+}
+
+prompt_yes_no() {
+  local q="$1"
+  local def="${2:-Y}"
+  local ans=""
+  if [ "$def" = "Y" ]; then
+    read -r -p "$q [Y/n]: " ans
+    ans="${ans:-Y}"
+  else
+    read -r -p "$q [y/N]: " ans
+    ans="${ans:-N}"
+  fi
+  case "$ans" in
+    Y|y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+get_mem_mb()  { awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0; }
+get_swap_mb() { awk '/^SwapTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0; }
+
+check_resources() {
+  local cpu mem_mb disk_mb
+  cpu="$(nproc 2>/dev/null || echo 0)"
+  mem_mb="$(get_mem_mb)"
+  disk_mb="$(df -Pm / | awk 'NR==2 {print $4}' 2>/dev/null || echo 0)"
+
+  info "Resource check: CPU=${cpu}, RAM=${mem_mb}MB, FreeDisk=${disk_mb}MB"
+
+  [ "$cpu" -ge "$MIN_CPU" ] || die "CPU too low: ${cpu}. Minimum is ${MIN_CPU}."
+  [ "$mem_mb" -ge "$MIN_RAM_MB" ] || die "RAM too low: ${mem_mb}MB. Minimum is ${MIN_RAM_MB}MB."
+  [ "$disk_mb" -ge "$MIN_DISK_MB" ] || die "Disk too low: ${disk_mb}MB free. Minimum is ${MIN_DISK_MB}MB free."
+
+  [ "$cpu" -ge "$REC_CPU" ] || warn "CPU below recommended (${cpu} < ${REC_CPU}). Builds may be slower."
+  [ "$mem_mb" -ge "$REC_RAM_MB" ] || warn "RAM below recommended (${mem_mb}MB < ${REC_RAM_MB}MB)."
+  [ "$disk_mb" -ge "$REC_DISK_MB" ] || warn "Disk below recommended (${disk_mb}MB < ${REC_DISK_MB}MB)."
+}
+
+ensure_swap_if_needed() {
+  local mem_mb swap_mb
+  mem_mb="$(get_mem_mb)"
+  swap_mb="$(get_swap_mb)"
+
+  if [ "$mem_mb" -ge "$REC_RAM_MB" ] || [ "$swap_mb" -gt 0 ]; then
+    return 0
+  fi
+
+  warn "Low RAM detected: ${mem_mb}MB and no swap. Recommended is ${REC_RAM_MB}MB+."
+  if prompt_yes_no "Create a ${SWAP_MB}MB swapfile to reduce build failures?" "Y"; then
+    info "Creating swapfile (/swapfile) ..."
+    if $SUDO fallocate -l "${SWAP_MB}M" /swapfile 2>/dev/null; then
+      :
+    else
+      $SUDO dd if=/dev/zero of=/swapfile bs=1M count="${SWAP_MB}" status=progress
+    fi
+    $SUDO chmod 600 /swapfile
+    $SUDO mkswap /swapfile >/dev/null
+    $SUDO swapon /swapfile
+    if ! grep -qE '^\s*/swapfile\s' /etc/fstab; then
+      echo "/swapfile none swap sw 0 0" | $SUDO tee -a /etc/fstab >/dev/null
+    fi
+    info "Swap enabled."
+  else
+    warn "Continuing without swap."
+  fi
+}
+
+check_ufw_and_open_ports() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    info "UFW not installed (ok)."
+    return 0
+  fi
+
+  local status
+  status="$($SUDO ufw status 2>/dev/null | head -n1 || true)"
+  if echo "$status" | grep -qi "Status: active"; then
+    warn "UFW is active."
+    if prompt_yes_no "Open required ports (22/80/443) in UFW?" "Y"; then
+      $SUDO ufw allow 22/tcp || true
+      $SUDO ufw allow 80/tcp || true
+      $SUDO ufw allow 443/tcp || true
+      $SUDO ufw reload || true
+      info "UFW rules applied."
+    else
+      warn "Ports may be blocked by UFW. Ensure 22/80/443 are allowed."
+    fi
+  else
+    info "UFW installed but not active."
+  fi
+}
+
+check_port_conflicts() {
+  if ss -ltnp 2>/dev/null | grep -Eq ':(80|443)\s'; then
+    warn "Port 80/443 is already in use (can block Caddy)."
+    ss -ltnp 2>/dev/null | grep -E ':(80|443)\s' || true
+
+    if prompt_yes_no "Attempt to stop common conflicting services (apache2/nginx)?" "Y"; then
+      for svc in apache2 nginx; do
+        if command -v systemctl >/dev/null 2>&1; then
+          if $SUDO systemctl is-active --quiet "$svc" 2>/dev/null; then
+            info "Stopping $svc ..."
+            $SUDO systemctl stop "$svc" || true
+            $SUDO systemctl disable "$svc" || true
+          fi
+        fi
+      done
+    fi
+  else
+    info "Ports 80/443 are free."
+  fi
 }
 
 menu_select_app() {
@@ -49,23 +180,6 @@ menu_select_app() {
     1) ;;
     *) die "Invalid selection: $APP_ID" ;;
   esac
-}
-
-prompt_inputs_common() {
-  echo ""
-  read -r -p "Base install directory [${DEFAULT_BASE_DIR}]: " BASE_DIR
-  BASE_DIR="${BASE_DIR:-$DEFAULT_BASE_DIR}"
-
-  echo ""
-  read -r -p "Domain (FQDN) for this install (e.g. portal.example.com): " APP_DOMAIN
-  [ -n "${APP_DOMAIN}" ] || die "Domain is required."
-  if ! echo "$APP_DOMAIN" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then
-    warn "Domain doesn't look like a typical FQDN. Continuing anyway: $APP_DOMAIN"
-  fi
-
-  echo ""
-  read -r -p "Branch (blank = default) [${DEFAULT_BRANCH}]: " BRANCH
-  BRANCH="${BRANCH:-$DEFAULT_BRANCH}"
 }
 
 ensure_prereqs() {
@@ -100,41 +214,31 @@ install_docker_if_missing() {
 
   if [ "$(id -u)" -ne 0 ]; then
     $SUDO usermod -aG docker "$USER" || true
-  fi
-
-  info "Docker installed."
-  if [ "$(id -u)" -ne 0 ]; then
     warn "You may need to log out/in to use docker without sudo. Installer will use sudo if needed."
   fi
 }
 
 docker_cmd() {
-  if docker ps >/dev/null 2>&1; then
-    echo "docker"
-  else
-    echo "$SUDO docker"
-  fi
+  if docker ps >/dev/null 2>&1; then echo "docker"; else echo "$SUDO docker"; fi
 }
 
 ensure_ssh_key() {
   local key_path="$1"
-
   mkdir -p "$HOME/.ssh"
   chmod 700 "$HOME/.ssh"
 
-  if [ -f "$key_path" ]; then
-    info "Using existing SSH key: $key_path"
-  else
+  if [ ! -f "$key_path" ]; then
     info "Generating SSH deploy key: $key_path"
     ssh-keygen -t ed25519 -f "$key_path" -N "" -C "saas-installer@$(hostname)" >/dev/null
     chmod 600 "$key_path"
+  else
+    info "Using existing SSH key: $key_path"
   fi
 
-  # Pre-seed known_hosts (accept-new)
   ssh -o StrictHostKeyChecking=accept-new -i "$key_path" -T git@github.com >/dev/null 2>&1 || true
 
   echo ""
-  info "If private repo clone fails, add this public key as a Deploy Key (read-only recommended):"
+  info "Add this public key as a Deploy Key (read-only recommended) to the PRIVATE repo:"
   echo "------------------------------------------------------------"
   cat "${key_path}.pub"
   echo "------------------------------------------------------------"
@@ -143,24 +247,22 @@ ensure_ssh_key() {
 
 git_ssh() {
   local key_path="$1"
-  echo "ssh -i \"$key_path\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+  echo "ssh -i "$key_path" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 }
 
-clone_or_update_repo() {
+clone_repo() {
   local repo_ssh="$1"
   local key_path="$2"
   local target_dir="$3"
   local branch="$4"
 
-  local GIT_SSH_COMMAND
-  GIT_SSH_COMMAND="$(git_ssh "$key_path")"
   export GIT_SSH_COMMAND
+  GIT_SSH_COMMAND="$(git_ssh "$key_path")"
 
   mkdir -p "$(dirname "$target_dir")"
 
   if [ -d "$target_dir/.git" ]; then
-    info "Repo already exists. Updating..."
-    git -C "$target_dir" remote set-url origin "$repo_ssh" >/dev/null 2>&1 || true
+    info "Repo exists. Updating..."
     git -C "$target_dir" fetch --all --prune
     if [ -n "$branch" ]; then
       git -C "$target_dir" checkout "$branch"
@@ -169,7 +271,7 @@ clone_or_update_repo() {
       git -C "$target_dir" pull --ff-only
     fi
   else
-    info "Cloning repo into: $target_dir"
+    info "Cloning into: $target_dir"
     if [ -n "$branch" ]; then
       git clone --branch "$branch" "$repo_ssh" "$target_dir"
     else
@@ -186,51 +288,34 @@ retry_clone_until_ok() {
 
   while true; do
     set +e
-    clone_or_update_repo "$repo_ssh" "$key_path" "$target_dir" "$branch"
+    clone_repo "$repo_ssh" "$key_path" "$target_dir" "$branch"
     local rc=$?
     set -e
-    if [ "$rc" -eq 0 ]; then
-      return 0
-    fi
+    [ "$rc" -eq 0 ] && return 0
 
-    warn "Clone failed (likely missing Deploy Key access)."
-    echo ""
-    echo "Next step:"
-    echo "  1) Copy the public key shown above"
-    echo "  2) GitHub → private repo → Settings → Deploy keys → Add deploy key"
-    echo "  3) Read-only recommended"
-    echo "  4) Then press ENTER to retry"
-    echo ""
+    warn "Clone failed (missing deploy key access is common)."
+    echo "Add the printed public key to GitHub Deploy Keys, then press ENTER to retry."
     read -r -p "Press ENTER to retry (or Ctrl+C to quit): " _
   done
 }
 
-deploy_app1() {
+deploy_saastest() {
   local target_dir="$1"
   local domain="$2"
 
   cd "$target_dir"
 
-  # Ensure .env exists
-  if [ ! -f ".env" ]; then
-    if [ -f ".env.example" ]; then
-      cp .env.example .env
-      info "Created .env from .env.example"
-    else
-      warn "No .env.example found; continuing."
-    fi
-  else
-    info ".env already exists."
+  if [ ! -f ".env" ] && [ -f ".env.example" ]; then
+    cp .env.example .env
+    info "Created .env from .env.example"
   fi
 
-  # Collect basic auth
   echo ""
   read -r -p "Basic Auth username [admin]: " BASIC_AUTH_USER
   BASIC_AUTH_USER="${BASIC_AUTH_USER:-admin}"
 
   echo ""
-  echo "Enter Basic Auth password (plaintext)."
-  echo "It will be hashed locally; only the hash is stored."
+  echo "Enter Basic Auth password (plaintext). It will be hashed locally."
   read -r -s -p "Basic Auth password: " BASIC_AUTH_PASS
   echo ""
   [ -n "${BASIC_AUTH_PASS}" ] || die "Password is required."
@@ -241,76 +326,74 @@ deploy_app1() {
   info "Generating BASIC_AUTH_HASH via Caddy..."
   BASIC_AUTH_HASH="$($DC run --rm caddy:2-alpine caddy hash-password --plaintext "$BASIC_AUTH_PASS")"
 
-  # Write caddy.env (prevents $ interpolation warnings)
   cat > caddy.env <<EOF
 APP_DOMAIN=${domain}
 BASIC_AUTH_USER=${BASIC_AUTH_USER}
 BASIC_AUTH_HASH=${BASIC_AUTH_HASH}
 EOF
   chmod 600 caddy.env || true
-  info "Wrote ./caddy.env"
 
-  # Patch docker-compose.yml if needed
-  if [ -f "docker-compose.yml" ]; then
-    if grep -q 'BASIC_AUTH_HASH: \${BASIC_AUTH_HASH' docker-compose.yml 2>/dev/null; then
-      info "Patching docker-compose.yml to use env_file ./caddy.env..."
-      python3 - <<'PY'
+  # Patch compose to load caddy.env via env_file (avoids $ interpolation warnings)
+  if grep -q 'BASIC_AUTH_HASH: \${BASIC_AUTH_HASH' docker-compose.yml 2>/dev/null; then
+    info "Patching docker-compose.yml to load caddy.env via env_file..."
+    python3 - <<'PY'
 import re, pathlib
 p = pathlib.Path("docker-compose.yml")
 s = p.read_text(encoding="utf-8")
 
-m = re.search(r"(^\s*caddy:\s*\n(?:^\s{4}.*\n)*)", s, re.M)
+m = re.search(r"(^\s*caddy:\s*
+(?:^\s{4}.*
+)*)", s, re.M)
 if not m:
     raise SystemExit("Could not locate 'caddy' service block.")
 
 block = m.group(1)
+block2 = re.sub(r"^\s{4}environment:\s*
+(?:^\s{6,}.*
+)+", "", block, flags=re.M)
 
-# Remove existing environment: mapping under caddy
-block2 = re.sub(r"^\s{4}environment:\s*\n(?:^\s{6,}.*\n)+", "", block, flags=re.M)
-
-# Insert env_file + environment list right after the caddy: line
 lines = block2.splitlines(True)
-insert_at = None
 for i, line in enumerate(lines):
     if re.match(r"^\s*caddy:\s*$", line):
-        insert_at = i
+        lines.insert(i+1, "    env_file:
+      - ./caddy.env
+    environment:
+      - APP_DOMAIN
+      - BASIC_AUTH_USER
+      - BASIC_AUTH_HASH
+")
         break
-if insert_at is None:
-    raise SystemExit("Could not find 'caddy:' line inside service block.")
 
-env_snip = "    env_file:\n      - ./caddy.env\n    environment:\n      - APP_DOMAIN\n      - BASIC_AUTH_USER\n      - BASIC_AUTH_HASH\n"
-lines.insert(insert_at + 1, env_snip)
 block3 = "".join(lines)
-
-s2 = s[:m.start(1)] + block3 + s[m.end(1):]
-p.write_text(s2, encoding="utf-8")
+p.write_text(s[:m.start(1)] + block3 + s[m.end(1):], encoding="utf-8")
 PY
-      info "docker-compose.yml patched."
-    else
-      info "docker-compose.yml already OK (or does not interpolate BASIC_AUTH_HASH)."
-    fi
-  else
-    die "docker-compose.yml not found."
   fi
 
-  info "Starting stack (docker compose up -d --build)..."
+  info "Starting stack..."
   $DC compose up -d --build
 
   echo ""
-  info "Deployment finished."
-  echo "URL: https://${domain}"
-  echo ""
-  echo "Commands:"
-  echo "  cd \"$target_dir\""
-  echo "  $DC compose ps"
-  echo "  $DC compose logs --tail=200"
+  info "Deployment finished: https://${domain}"
 }
 
 main() {
   print_header
+  assert_ubuntu
+  check_resources
+  ensure_swap_if_needed
+  check_ufw_and_open_ports
+  check_port_conflicts
 
   menu_select_app
-  prompt_inputs_common
+
+  echo ""
+  read -r -p "Base install directory [${DEFAULT_BASE_DIR}]: " BASE_DIR
+  BASE_DIR="${BASE_DIR:-$DEFAULT_BASE_DIR}"
+
+  echo ""
+  read -r -p "Domain (FQDN) for this install (e.g. portal.example.com): " APP_DOMAIN
+  [ -n "${APP_DOMAIN}" ] || die "Domain is required."
+
   ensure_prereqs
   install_docker_if_missing
 
@@ -318,18 +401,18 @@ main() {
   read -r -p "Private repo SSH URL [${APP1_REPO_DEFAULT}]: " REPO_SSH
   REPO_SSH="${REPO_SSH:-$APP1_REPO_DEFAULT}"
 
+  echo ""
+  read -r -p "Branch (blank = default): " BRANCH
+
   REPO_NAME="$(basename "$REPO_SSH")"
   REPO_NAME="${REPO_NAME%.git}"
   TARGET_DIR="${BASE_DIR}/${REPO_NAME}"
-
   KEY_PATH="$HOME/.ssh/saas_installer_${REPO_NAME}_ed25519"
 
   ensure_ssh_key "$KEY_PATH"
   retry_clone_until_ok "$REPO_SSH" "$KEY_PATH" "$TARGET_DIR" "$BRANCH"
 
-  case "${APP_ID}" in
-    1) deploy_app1 "$TARGET_DIR" "$APP_DOMAIN" ;;
-  esac
+  deploy_saastest "$TARGET_DIR" "$APP_DOMAIN"
 }
 
 main "$@"
