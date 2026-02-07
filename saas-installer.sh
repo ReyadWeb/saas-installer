@@ -523,7 +523,7 @@ write_cloudflare_override_files() {
 
   mkdir -p ./caddy
 
-  python3 - <<'PY'
+  python3 - "$base_caddyfile" "./caddy/Caddyfile.cloudflare" <<'PY'
 import pathlib, sys
 base = pathlib.Path(sys.argv[1])
 dst  = pathlib.Path(sys.argv[2])
@@ -538,7 +538,7 @@ for i, line in enumerate(lines):
 if not inserted:
     raise SystemExit("Failed to auto-insert tls directive into Caddyfile.")
 dst.write_text("\n".join(out).rstrip("\n") + "\n", encoding="utf-8")
-PY "$base_caddyfile" "./caddy/Caddyfile.cloudflare"
+PY
 
   cat > docker-compose.override.yml <<'EOF'
 services:

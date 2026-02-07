@@ -1,155 +1,118 @@
-# ReyadWeb SaaS Installer
+# SaaS Installer (ReyadWeb)
 
-A **public bootstrap repo** that installs ReyadWeb SaaS apps on a fresh **Ubuntu VPS**.
+A small **public bootstrap installer** that provisions a fresh **Ubuntu** VPS and deploys a selected ReyadWeb SaaS app from a **private GitHub repo** (via SSH deploy key).
 
-- **Public repo (this one):** installer + preflight checks + TLS setup
-- **Private repos:** each SaaS app (cloned via **GitHub Deploy Key**)
-
-Currently supported SaaS:
-- **saastest (AutoFix Pro)** — Docker Compose stack (**Postgres + Node API + Caddy**)
+Current supported app:
+- **AutoFix Pro (saastest)** — Docker Compose stack: Postgres + Node API + Caddy + Basic Auth
 
 ---
 
-## Quick start (recommended)
+## What this installer does
 
-### 0) Prereqs (do this first)
-- ✅ Ubuntu VPS + a user with `sudo`
-- ✅ Domain/subdomain DNS record points to the VPS IP (e.g. `portal.example.com`)
-- ✅ Ports **80** and **443** reachable from the internet (UFW can be opened by the installer)
+- Validates you are on **Ubuntu** (supported: 22.04 / 24.04)
+- Installs required dependencies (git, curl, docker, compose plugin, etc.)
+- Optionally checks / opens firewall ports (80/443 and SSH)
+- Prompts for:
+  - **Domain** (FQDN, e.g. `portal.example.com`)
+  - **TLS provider**
+    - **Let's Encrypt** (recommended; works with Cloudflare orange-cloud or DNS-only)
+    - **Cloudflare Origin CA** (manual cert/key)
+  - **Private repo SSH URL** + optional branch
+- Generates (or reuses) an **SSH deploy key** and prints the public key so you can add it to the private repo.
+- Clones the private repo and runs `docker compose up -d --build`
+- Prints the final URL when done
 
-> Cloudflare note:  
-> - **Let’s Encrypt** works best if the record is **DNS only** during certificate issuance (you can switch back to proxied later).  
-> - **Cloudflare Origin CA** is designed for **proxied (orange cloud)** records.
+---
 
-### 1) Download → inspect → run
+## Prerequisites (before you run it)
+
+### 1) Create a sudo user (don’t use root)
+On a fresh VPS:
+
 ```bash
-curl -fsSL -o saas-installer.sh https://raw.githubusercontent.com/ReyadWeb/saas-installer/main/saas-installer.sh
-less saas-installer.sh
-bash saas-installer.sh
+adduser deploy-1
+usermod -aG sudo deploy-1
 ```
 
-### 2) Follow the prompts
-- choose the SaaS (currently **saastest**)
-- enter the **domain**
-- the installer will generate or ask for the **Basic Auth** password
-- if the SaaS repo is private, it will print a **Deploy Key** (SSH public key)
+Log out and back in as `deploy-1`.
+
+### 2) Point your domain to the VPS
+Create a DNS **A record**:
+
+- `portal.example.com` → **YOUR_VPS_PUBLIC_IP**
+
+If you use **Cloudflare**:
+- Orange-cloud (proxied) is OK.
+- Set SSL mode to **Full (strict)**.
+- You do **not** need to install a Cloudflare certificate on the VPS if you use **Let's Encrypt** on the origin (Caddy handles this).
 
 ---
 
-## Private repo access (GitHub Deploy Key)
+## Install
 
-If the SaaS repo is private, the installer will generate a key and print the **public** part.
+### Option A (recommended): download then run
 
-Add it here:
-- GitHub → *private SaaS repo* → **Settings** → **Deploy keys** → **Add deploy key**
-- Paste the public key
-- Enable **Read access** (recommended)
-
-Then rerun the installer.
-
----
-
-## Non-interactive install (automation-friendly)
-
-### Let’s Encrypt (default)
 ```bash
-bash saas-installer.sh --non-interactive \
-  --domain portal.example.com \
-  --repo git@github.com:ReyadWeb/saastest.git \
-  --tls letsencrypt \
-  --yes
+curl -fsSL https://raw.githubusercontent.com/ReyadWeb/saas-installer/main/saas-installer.sh -o saas-installer.sh
+chmod +x saas-installer.sh
+./saas-installer.sh
 ```
 
-### Cloudflare Origin CA
-Upload your Origin cert/key to the VPS first, then:
+### Option B: one-liner (less safe)
+
 ```bash
-bash saas-installer.sh --non-interactive \
-  --domain portal.example.com \
-  --repo git@github.com:ReyadWeb/saastest.git \
-  --tls cloudflare \
-  --cf-cert /root/origin.crt \
-  --cf-key  /root/origin.key \
-  --yes
-```
-
-**Non-interactive note:** if the deploy key is missing in GitHub, the script prints the key and exits with code `2`. Add it, then rerun the same command.
-
----
-
-## TLS provider options
-
-### Option A — Let’s Encrypt (default)
-Caddy automatically obtains a public certificate.
-
-Requirements:
-- Ports **80** and **443** open
-- DNS record points to the VPS IP
-
-Cloudflare proxy note:
-- If ACME challenges fail while proxied, switch to **DNS only**, redeploy, then switch back.
-
-### Option B — Cloudflare Origin CA
-Use a Cloudflare Origin certificate (valid for Cloudflare → origin).
-
-Important:
-- Origin CA cert is **not browser-trusted**. Keep the DNS record **proxied** (orange cloud).
-- Cloudflare SSL/TLS mode should be **Full (strict)**.
-
----
-
-## Basic Auth password behavior
-
-### First install
-- Installer can generate a strong random password (default **Yes**)
-- It prints the password **once**
-- Only the **bcrypt hash** is stored (plaintext is not stored)
-
-### If you lose the password (reset without losing DB)
-```bash
-bash saas-installer.sh --reset-auth
-```
-
-### Full reinstall (deletes database)
-```bash
-bash saas-installer.sh --reinstall --yes
+curl -fsSL https://raw.githubusercontent.com/ReyadWeb/saas-installer/main/saas-installer.sh | bash
 ```
 
 ---
 
-## Preflight checks (built-in)
-The installer checks:
-- OS is Ubuntu
-- minimum recommended resources (CPU/RAM/disk)
-- UFW: can auto-allow ports **22/80/443**
-- Docker: installs if missing
+## Private repo access (SSH deploy key)
 
----
+During install, the script prints a public key like:
 
-## After install: common commands
-```bash
-cd ~/apps/saastest
-sudo docker compose ps
-sudo docker compose logs --tail=200
-sudo docker compose restart caddy
+```
+ssh-ed25519 AAAA... saas-installer@hostname
 ```
 
----
+Add it in GitHub:
+- Private repo → **Settings** → **Deploy keys** → **Add deploy key**
+- Check **Allow read access** (recommended)
 
-## Repo structure (recommended)
-
-This is a good structure and scales well:
-
-- **Repo 1 (public):** installer + menu + provisioning
-- **Repo 2+ (private):** SaaS repos (each with its own `docker-compose.yml`, app code, migrations, etc.)
-
-Tips to make it even better:
-- Tag releases for the installer (e.g., `v0.1.0`) and reference a versioned URL in docs.
-- Keep SaaS repos versioned (tags/branches) so updates can be pinned per VPS.
-- Add a `saas.lock` file per install (records repo + commit + TLS mode + domain) for reliable upgrades.
+Then press Enter in the installer to retry cloning.
 
 ---
 
-## Help / flags reference
-```bash
-bash saas-installer.sh --help
-```
+## After install
+
+- The app will be available at: `https://YOUR_DOMAIN`
+- Basic Auth is enforced at the edge (Caddy).
+- The installer will show a generated password only once — **copy it** and store it securely.
+
+To reset Basic Auth later, re-run the installer and choose the reset option (or use the documented reset command shown by the script).
+
+---
+
+## Common issues
+
+### “Hi … GitHub does not provide shell access.”
+This is normal. It means the SSH key authentication succeeded.
+
+### Cloudflare error **525**
+Most common causes:
+- Origin container not serving TLS yet / Caddy is restarting
+- Wrong domain passed to the installer (or missing `APP_DOMAIN` in container env)
+- Cloudflare SSL mode set incorrectly
+
+Fix:
+- Confirm the stack is up: `sudo docker compose ps`
+- Check Caddy logs: `sudo docker compose logs -n 200 caddy`
+- Ensure Cloudflare SSL mode is **Full (strict)** and DNS points to the correct IP.
+
+---
+
+## Security notes
+
+- This installer will run privileged operations via **sudo**.
+- Prefer “Option A” (download then run), and review the script before executing.
+- Treat the deploy key as sensitive. If it ever leaks, rotate it in GitHub.
+
